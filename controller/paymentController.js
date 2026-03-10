@@ -47,8 +47,49 @@ const getPaymentsByInviteCode = async (req, res) => {
 // @access  Private
 const getAllPayments = async (req, res) => {
   try {
-    const payments = await Payment.find().sort({ createdAt: -1 });
+    const { weddingId } = req.query;
+    let query = {};
+    
+    if (weddingId) {
+      query.$or = [
+        { inviteCode: { $regex: weddingId, $options: 'i' } },
+        { weddingName: { $regex: weddingId, $options: 'i' } }
+      ];
+    }
+    
+    const payments = await Payment.find(query).sort({ createdAt: -1 });
     return res.status(200).json(payments);
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+// @desc    Add a ledger entry (manual cash/gift entry)
+// @route   POST /api/payments/ledger
+// @access  Private
+const addLedgerEntry = async (req, res) => {
+  try {
+    const { guestName, weddingId, amount, giftType, date } = req.body;
+
+    if (!guestName || !amount || !giftType) {
+      return res.status(400).json({ message: 'Guest name, amount, and gift type are required' });
+    }
+
+    const entry = await Payment.create({
+      inviteCode: weddingId || 'manual',
+      guestName,
+      relation: giftType, // Using relation field to store gift type
+      amount: parseInt(amount),
+      upiId: 'manual-entry',
+      weddingName: weddingId || '',
+      paymentStatus: 'completed',
+      paymentTime: date || new Date()
+    });
+
+    return res.status(201).json({
+      success: true,
+      data: entry
+    });
   } catch (error) {
     return res.status(500).json({ message: error.message });
   }
@@ -57,6 +98,7 @@ const getAllPayments = async (req, res) => {
 module.exports = {
   recordPayment,
   getPaymentsByInviteCode,
-  getAllPayments
+  getAllPayments,
+  addLedgerEntry
 };
 
