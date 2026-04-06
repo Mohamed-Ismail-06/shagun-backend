@@ -65,6 +65,9 @@ const createRazorpayQrCode = (payload) =>
     request.end();
   });
 
+const buildQrImageUrl = (text) =>
+  `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(text)}`;
+
 // @desc    Generate a QR code payload for a wedding
 // @route   POST /api/qr-codes/generate
 // @access  Private
@@ -95,6 +98,9 @@ const generateQRCode = async (req, res) => {
     if (!ceremony) {
       return res.status(400).json({ message: 'No ceremony found for this wedding ID. Create ceremony first.' });
     }
+    if (!ceremony.organiserUpiId) {
+      return res.status(400).json({ message: 'Organiser UPI ID missing for this ceremony.' });
+    }
 
     if (mongoose.Types.ObjectId.isValid(normalizedWeddingId)) {
       wedding = await Wedding.findOne({ _id: normalizedWeddingId, user: req.user._id });
@@ -105,28 +111,49 @@ const generateQRCode = async (req, res) => {
     const merchantId = String(process.env.RAZORPAY_MERCHANT_ID || '').trim();
     const displayName = (resolvedWeddingName || `Wedding ${normalizedWeddingId}`).slice(0, 64);
     const description = `Shagun payment for ${displayName}`.slice(0, 255);
+    const organizerName = (req.user?.name || 'Shagun Organiser').slice(0, 40);
+    const noteText = resolvedWeddingName
+      ? `Shagun payment for ${resolvedWeddingName}`
+      : `Shagun payment for wedding ${normalizedWeddingId}`;
 
-    // Razorpay API expects amount in paise if fixed_amount=true.
-    // We keep this QR as multiple_use + variable amount so guests can pay any value.
-    const razorpayQr = await createRazorpayQrCode({
-      type: 'upi_qr',
-      name: `Shagun ${displayName}`.slice(0, 40),
-      usage: 'multiple_use',
-      fixed_amount: false,
-      description,
-      notes: {
-        inviteCode,
-        weddingId: normalizedWeddingId,
-        weddingName: resolvedWeddingName || normalizedWeddingId,
-      },
-    });
+    let razorpayQr = null;
+    let shareLink = '';
+    let paymentLink = '';
+    let provider = 'razorpay';
+    let warning = '';
 
-    if (!razorpayQr?.id || !razorpayQr?.image_url) {
-      return res.status(502).json({ message: 'Razorpay did not return a valid QR code.' });
+    try {
+      // Razorpay API expects amount in paise if fixed_amount=true.
+      // We keep this QR as multiple_use + variable amount so guests can pay any value.
+      razorpayQr = await createRazorpayQrCode({
+        type: 'upi_qr',
+        name: `Shagun ${displayName}`.slice(0, 40),
+        usage: 'multiple_use',
+        fixed_amount: false,
+        description,
+        notes: {
+          inviteCode,
+          weddingId: normalizedWeddingId,
+          weddingName: resolvedWeddingName || normalizedWeddingId,
+        },
+      });
+
+      if (!razorpayQr?.id || !razorpayQr?.image_url) {
+        throw new Error('Razorpay did not return a valid QR code.');
+      }
+
+      shareLink = razorpayQr.image_url;
+      paymentLink = razorpayQr.short_url || razorpayQr.image_url;
+    } catch (razorpayError) {
+      // Fallback: generate direct UPI QR so host can still collect payments.
+      provider = 'upi_fallback';
+      warning = `Razorpay unavailable: ${razorpayError.message}`;
+      paymentLink = `upi://pay?pa=${encodeURIComponent(ceremony.organiserUpiId)}&pn=${encodeURIComponent(
+        organizerName
+      )}&tn=${encodeURIComponent(noteText)}&cu=INR`;
+      shareLink = buildQrImageUrl(paymentLink);
     }
 
-    const shareLink = razorpayQr.image_url;
-    const paymentLink = razorpayQr.short_url || razorpayQr.image_url;
     const organiserUpiId = ceremony.organiserUpiId || merchantId || 'razorpay-qr';
 
     const qrRecord = await QRCode.create({
@@ -139,7 +166,7 @@ const generateQRCode = async (req, res) => {
       inviteCode,
       shareLink,
       paymentLink,
-      razorpayQrCodeId: razorpayQr.id,
+      razorpayQrCodeId: razorpayQr?.id || '',
     });
 
     return res.status(201).json({
@@ -151,11 +178,13 @@ const generateQRCode = async (req, res) => {
       inviteCode: qrRecord.inviteCode,
       shareLink: qrRecord.shareLink,
       paymentLink: qrRecord.paymentLink,
+      provider,
+      warning,
       razorpay: {
-        qrCodeId: razorpayQr.id,
-        imageUrl: razorpayQr.image_url,
-        shortUrl: razorpayQr.short_url || '',
-        status: razorpayQr.status || 'active',
+        qrCodeId: razorpayQr?.id || '',
+        imageUrl: razorpayQr?.image_url || '',
+        shortUrl: razorpayQr?.short_url || '',
+        status: razorpayQr?.status || (provider === 'upi_fallback' ? 'fallback' : 'active'),
       },
       generatedAt: qrRecord.generatedAt,
     });
