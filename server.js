@@ -15,6 +15,7 @@ const app = express();
 
 // Middleware
 app.use(cors());
+app.use('/api/webhooks/razorpay', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // Routes
@@ -23,6 +24,7 @@ app.use('/api/weddings', require('./routes/wedding'));
 app.use('/api/ceremonies', require('./routes/ceremony'));
 app.use('/api/qr-codes', require('./routes/qrCode'));
 app.use('/api/payments', require('./routes/payment'));
+app.use('/api/webhooks', require('./routes/webhook'));
 
 // Basic route
 app.get('/', (req, res) => {

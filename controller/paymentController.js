@@ -1,4 +1,6 @@
 const Payment = require('../model/Payment');
+const QRCode = require('../model/QRCode');
+const crypto = require('crypto');
 
 // @desc    Record a payment from guest
 // @route   POST /api/payments/record
@@ -95,10 +97,127 @@ const addLedgerEntry = async (req, res) => {
   }
 };
 
+const verifyRazorpayWebhookSignature = (rawBody, signature, secret) => {
+  const digest = crypto
+    .createHmac('sha256', secret)
+    .update(rawBody)
+    .digest('hex');
+
+  return digest === signature;
+};
+
+const toRupees = (paiseAmount) => {
+  const value = Number(paiseAmount || 0);
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+  return Math.round(value / 100);
+};
+
+const normalizeText = (value, fallback) => {
+  const text = String(value || '').trim();
+  return text || fallback;
+};
+
+// @desc    Receive Razorpay webhook events and auto-record QR payments
+// @route   POST /api/webhooks/razorpay
+// @access  Public
+const handleRazorpayWebhook = async (req, res) => {
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature = req.headers['x-razorpay-signature'];
+    const rawBody = req.body;
+
+    if (!webhookSecret) {
+      return res.status(500).json({ message: 'RAZORPAY_WEBHOOK_SECRET is not configured.' });
+    }
+
+    if (!signature || !Buffer.isBuffer(rawBody)) {
+      return res.status(400).json({ message: 'Invalid webhook payload.' });
+    }
+
+    const isSignatureValid = verifyRazorpayWebhookSignature(rawBody, signature, webhookSecret);
+    if (!isSignatureValid) {
+      return res.status(401).json({ message: 'Invalid webhook signature.' });
+    }
+
+    const payload = JSON.parse(rawBody.toString('utf8'));
+    const event = payload?.event;
+
+    // We process payment.captured and qr_code.credited events for QR flows.
+    if (event !== 'payment.captured' && event !== 'qr_code.credited') {
+      return res.status(200).json({ success: true, message: `Event ${event} ignored.` });
+    }
+
+    const paymentEntity = payload?.payload?.payment?.entity;
+    if (!paymentEntity?.id) {
+      return res.status(200).json({ success: true, message: 'No payment entity found in webhook.' });
+    }
+
+    const existingPayment = await Payment.findOne({ paymentId: paymentEntity.id });
+    if (existingPayment) {
+      return res.status(200).json({ success: true, message: 'Payment already recorded.' });
+    }
+
+    const qrEntity = payload?.payload?.qr_code?.entity;
+    const notes = {
+      ...(paymentEntity?.notes || {}),
+      ...(qrEntity?.notes || {}),
+    };
+
+    const qrCodeId = normalizeText(
+      qrEntity?.id || paymentEntity?.acquirer_data?.qr_code_id || paymentEntity?.qr_code_id,
+      ''
+    );
+
+    let linkedQr = null;
+    if (qrCodeId) {
+      linkedQr = await QRCode.findOne({ razorpayQrCodeId: qrCodeId }).sort({ createdAt: -1 });
+    }
+
+    if (!linkedQr && notes.inviteCode) {
+      linkedQr = await QRCode.findOne({ inviteCode: String(notes.inviteCode) }).sort({ createdAt: -1 });
+    }
+
+    const inviteCode = normalizeText(notes.inviteCode, linkedQr?.inviteCode || qrCodeId || 'razorpay');
+    const weddingName = normalizeText(notes.weddingName, linkedQr?.weddingName || '');
+    const upiId = normalizeText(
+      paymentEntity?.upi?.vpa || paymentEntity?.acquirer_data?.vpa,
+      linkedQr?.organiserUpiId || 'razorpay-upi'
+    );
+
+    const createdRecord = await Payment.create({
+      inviteCode,
+      guestName: normalizeText(paymentEntity?.email || paymentEntity?.contact, 'Razorpay Guest'),
+      relation: 'QR Payment',
+      amount: toRupees(paymentEntity?.amount),
+      upiId,
+      weddingName,
+      paymentStatus: paymentEntity?.status === 'captured' ? 'completed' : 'pending',
+      paymentId: paymentEntity.id,
+      paymentTime: paymentEntity?.captured_at
+        ? new Date(paymentEntity.captured_at * 1000)
+        : new Date(),
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: 'Webhook processed and payment recorded.',
+      data: {
+        paymentId: createdRecord.paymentId,
+        inviteCode: createdRecord.inviteCode,
+      },
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
 module.exports = {
   recordPayment,
   getPaymentsByInviteCode,
   getAllPayments,
-  addLedgerEntry
+  addLedgerEntry,
+  handleRazorpayWebhook
 };
 

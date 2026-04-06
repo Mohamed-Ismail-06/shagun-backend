@@ -48,6 +48,12 @@ const qrCodeSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    razorpayQrCodeId: {
+      type: String,
+      trim: true,
+      default: '',
+      index: true,
+    },
     generatedAt: {
       type: Date,
       default: Date.now,
