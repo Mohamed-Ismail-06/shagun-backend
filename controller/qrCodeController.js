@@ -42,9 +42,9 @@ const generateQRCode = async (req, res) => {
     const resolvedWeddingName = wedding?.weddingName || ceremony?.ceremonyName || '';
     const merchantId = String(process.env.RAZORPAY_MERCHANT_ID || '').trim();
     const baseUrl = process.env.WEB_BASE_URL || 'https://mohamed-ismail-06.github.io/shagun';
-    const paymentPageUrl = `${baseUrl}/payment.html?code=${inviteCode}&wedding=${encodeURIComponent(
-      resolvedWeddingName || normalizedWeddingId
-    )}`;
+    const paymentPageUrl = `${baseUrl}/payment.html?code=${inviteCode}&upi=${encodeURIComponent(
+      ceremony.organiserUpiId || ''
+    )}&wedding=${encodeURIComponent(resolvedWeddingName || normalizedWeddingId)}`;
     const shareLink = paymentPageUrl;
     const paymentLink = paymentPageUrl;
     const organiserUpiId = ceremony.organiserUpiId || merchantId || 'razorpay';
