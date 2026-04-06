@@ -1,6 +1,7 @@
 const Payment = require('../model/Payment');
 const QRCode = require('../model/QRCode');
 const crypto = require('crypto');
+const https = require('https');
 
 // @desc    Record a payment from guest
 // @route   POST /api/payments/record
@@ -119,6 +120,168 @@ const normalizeText = (value, fallback) => {
   return text || fallback;
 };
 
+const createRazorpayOrder = (payload) =>
+  new Promise((resolve, reject) => {
+    const razorpayKeyId = process.env.RAZORPAY_KEY_ID;
+    const razorpayKeySecret = process.env.RAZORPAY_KEY_SECRET;
+
+    if (!razorpayKeyId || !razorpayKeySecret) {
+      reject(new Error('Razorpay keys are missing on server.'));
+      return;
+    }
+
+    const body = JSON.stringify(payload);
+    const auth = Buffer.from(`${razorpayKeyId}:${razorpayKeySecret}`).toString('base64');
+
+    const request = https.request(
+      {
+        hostname: 'api.razorpay.com',
+        path: '/v1/orders',
+        method: 'POST',
+        headers: {
+          Authorization: `Basic ${auth}`,
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(body),
+        },
+      },
+      (response) => {
+        let data = '';
+        response.on('data', (chunk) => {
+          data += chunk;
+        });
+        response.on('end', () => {
+          let parsed = {};
+          try {
+            parsed = data ? JSON.parse(data) : {};
+          } catch (_error) {
+            reject(new Error('Invalid response from Razorpay order API.'));
+            return;
+          }
+
+          if (response.statusCode >= 200 && response.statusCode < 300) {
+            resolve(parsed);
+            return;
+          }
+
+          const reason = parsed?.error?.description || parsed?.error?.reason || parsed?.error?.code;
+          reject(new Error(reason || `Razorpay order API failed with status ${response.statusCode}.`));
+        });
+      }
+    );
+
+    request.on('error', (error) => reject(error));
+    request.write(body);
+    request.end();
+  });
+
+// @desc    Create Razorpay order for guest payment page
+// @route   POST /api/payments/create-order
+// @access  Public
+const createOrderForGuest = async (req, res) => {
+  try {
+    const { inviteCode, guestName, relation, amount, weddingName } = req.body;
+
+    if (!inviteCode || !guestName || !relation || !amount) {
+      return res.status(400).json({ message: 'inviteCode, guestName, relation and amount are required.' });
+    }
+
+    const parsedAmount = Number(amount);
+    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+      return res.status(400).json({ message: 'Amount must be greater than zero.' });
+    }
+
+    const amountInPaise = Math.round(parsedAmount * 100);
+    const safeInvite = String(inviteCode).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16) || 'guest';
+    const receipt = `rcpt_${safeInvite}_${Date.now()}`.slice(0, 40);
+
+    const order = await createRazorpayOrder({
+      amount: amountInPaise,
+      currency: 'INR',
+      receipt,
+      notes: {
+        inviteCode: String(inviteCode),
+        guestName: String(guestName).slice(0, 64),
+        relation: String(relation).slice(0, 64),
+        weddingName: String(weddingName || '').slice(0, 128),
+      },
+    });
+
+    return res.status(201).json({
+      success: true,
+      orderId: order.id,
+      amount: order.amount,
+      currency: order.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+    });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
+const verifyRazorpayPaymentSignature = ({ orderId, paymentId, signature, secret }) => {
+  const expected = crypto.createHmac('sha256', secret).update(`${orderId}|${paymentId}`).digest('hex');
+  return expected === signature;
+};
+
+// @desc    Verify Razorpay payment signature and persist successful payment
+// @route   POST /api/payments/verify
+// @access  Public
+const verifyGuestPayment = async (req, res) => {
+  try {
+    const {
+      inviteCode,
+      guestName,
+      relation,
+      amount,
+      weddingName,
+      razorpayOrderId,
+      razorpayPaymentId,
+      razorpaySignature,
+    } = req.body;
+
+    if (!inviteCode || !guestName || !relation || !amount || !razorpayOrderId || !razorpayPaymentId || !razorpaySignature) {
+      return res.status(400).json({ message: 'Missing required payment verification fields.' });
+    }
+
+    const secret = process.env.RAZORPAY_KEY_SECRET;
+    if (!secret) {
+      return res.status(500).json({ message: 'Razorpay key secret is missing on server.' });
+    }
+
+    const isValid = verifyRazorpayPaymentSignature({
+      orderId: razorpayOrderId,
+      paymentId: razorpayPaymentId,
+      signature: razorpaySignature,
+      secret,
+    });
+
+    if (!isValid) {
+      return res.status(400).json({ message: 'Invalid Razorpay payment signature.' });
+    }
+
+    const existing = await Payment.findOne({ paymentId: razorpayPaymentId });
+    if (existing) {
+      return res.status(200).json({ success: true, data: existing, message: 'Payment already recorded.' });
+    }
+
+    const payment = await Payment.create({
+      inviteCode: String(inviteCode),
+      guestName: String(guestName),
+      relation: String(relation),
+      amount: Number(amount),
+      upiId: 'razorpay',
+      weddingName: String(weddingName || ''),
+      paymentStatus: 'completed',
+      paymentId: razorpayPaymentId,
+      paymentTime: new Date(),
+    });
+
+    return res.status(201).json({ success: true, data: payment });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
+  }
+};
+
 // @desc    Receive Razorpay webhook events and auto-record QR payments
 // @route   POST /api/webhooks/razorpay
 // @access  Public
@@ -218,6 +381,8 @@ module.exports = {
   getPaymentsByInviteCode,
   getAllPayments,
   addLedgerEntry,
-  handleRazorpayWebhook
+  handleRazorpayWebhook,
+  createOrderForGuest,
+  verifyGuestPayment,
 };
 
