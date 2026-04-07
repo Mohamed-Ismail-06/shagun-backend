@@ -8,7 +8,7 @@ const https = require('https');
 // @access  Public
 const recordPayment = async (req, res) => {
   try {
-    const { inviteCode, guestName, relation, amount, upiId, weddingName, paymentStatus } = req.body;
+    const { inviteCode, weddingId, guestName, relation, amount, upiId, weddingName, paymentStatus } = req.body;
 
     if (!inviteCode || !guestName || !relation || !amount || !upiId) {
       return res.status(400).json({ message: 'All fields are required' });
@@ -16,6 +16,7 @@ const recordPayment = async (req, res) => {
 
     const payment = await Payment.create({
       inviteCode,
+      weddingId: weddingId || '',
       guestName,
       relation,
       amount,
@@ -55,6 +56,7 @@ const getAllPayments = async (req, res) => {
     
     if (weddingId) {
       query.$or = [
+        { weddingId: { $regex: weddingId, $options: 'i' } },
         { inviteCode: { $regex: weddingId, $options: 'i' } },
         { weddingName: { $regex: weddingId, $options: 'i' } }
       ];
@@ -80,6 +82,7 @@ const addLedgerEntry = async (req, res) => {
 
     const entry = await Payment.create({
       inviteCode: weddingId || 'manual',
+      weddingId: weddingId || '',
       guestName,
       relation: giftType, // Using relation field to store gift type
       amount: parseInt(amount),
@@ -193,6 +196,9 @@ const createOrderForGuest = async (req, res) => {
     const amountInPaise = Math.round(parsedAmount * 100);
     const safeInvite = String(inviteCode).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 16) || 'guest';
     const receipt = `rcpt_${safeInvite}_${Date.now()}`.slice(0, 40);
+    const linkedQr = await QRCode.findOne({ inviteCode: String(inviteCode) }).sort({ createdAt: -1 });
+    const resolvedWeddingId = normalizeText(linkedQr?.weddingId, '');
+    const resolvedWeddingName = normalizeText(weddingName, linkedQr?.weddingName || '');
 
     const order = await createRazorpayOrder({
       amount: amountInPaise,
@@ -200,11 +206,30 @@ const createOrderForGuest = async (req, res) => {
       receipt,
       notes: {
         inviteCode: String(inviteCode),
+        weddingId: resolvedWeddingId,
         guestName: String(guestName).slice(0, 64),
         relation: String(relation).slice(0, 64),
-        weddingName: String(weddingName || '').slice(0, 128),
+        weddingName: String(resolvedWeddingName || '').slice(0, 128),
       },
     });
+
+    // Persist a pending row immediately so reports/ledger can reflect attempted payment quickly.
+    // It will be finalized by verify API or webhook.
+    await Payment.findOneAndUpdate(
+      { paymentOrderId: order.id },
+      {
+        inviteCode: String(inviteCode),
+        weddingId: resolvedWeddingId,
+        guestName: String(guestName),
+        relation: String(relation),
+        amount: parsedAmount,
+        upiId: 'razorpay',
+        weddingName: String(resolvedWeddingName || ''),
+        paymentStatus: 'pending',
+        paymentOrderId: order.id,
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     return res.status(201).json({
       success: true,
@@ -264,17 +289,27 @@ const verifyGuestPayment = async (req, res) => {
       return res.status(200).json({ success: true, data: existing, message: 'Payment already recorded.' });
     }
 
-    const payment = await Payment.create({
-      inviteCode: String(inviteCode),
-      guestName: String(guestName),
-      relation: String(relation),
-      amount: Number(amount),
-      upiId: 'razorpay',
-      weddingName: String(weddingName || ''),
-      paymentStatus: 'completed',
-      paymentId: razorpayPaymentId,
-      paymentTime: new Date(),
-    });
+    const linkedQr = await QRCode.findOne({ inviteCode: String(inviteCode) }).sort({ createdAt: -1 });
+    const resolvedWeddingId = normalizeText(linkedQr?.weddingId, '');
+    const resolvedWeddingName = normalizeText(weddingName, linkedQr?.weddingName || '');
+
+    const payment = await Payment.findOneAndUpdate(
+      { paymentOrderId: razorpayOrderId },
+      {
+        inviteCode: String(inviteCode),
+        weddingId: resolvedWeddingId,
+        guestName: String(guestName),
+        relation: String(relation),
+        amount: Number(amount),
+        upiId: 'razorpay',
+        weddingName: String(resolvedWeddingName || ''),
+        paymentStatus: 'completed',
+        paymentId: razorpayPaymentId,
+        paymentOrderId: razorpayOrderId,
+        paymentTime: new Date(),
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     return res.status(201).json({ success: true, data: payment });
   } catch (error) {
@@ -343,25 +378,35 @@ const handleRazorpayWebhook = async (req, res) => {
     }
 
     const inviteCode = normalizeText(notes.inviteCode, linkedQr?.inviteCode || qrCodeId || 'razorpay');
+    const weddingId = normalizeText(notes.weddingId, linkedQr?.weddingId || '');
     const weddingName = normalizeText(notes.weddingName, linkedQr?.weddingName || '');
     const upiId = normalizeText(
       paymentEntity?.upi?.vpa || paymentEntity?.acquirer_data?.vpa,
       linkedQr?.organiserUpiId || 'razorpay-upi'
     );
 
-    const createdRecord = await Payment.create({
-      inviteCode,
-      guestName: normalizeText(paymentEntity?.email || paymentEntity?.contact, 'Razorpay Guest'),
-      relation: 'QR Payment',
-      amount: toRupees(paymentEntity?.amount),
-      upiId,
-      weddingName,
-      paymentStatus: paymentEntity?.status === 'captured' ? 'completed' : 'pending',
-      paymentId: paymentEntity.id,
-      paymentTime: paymentEntity?.captured_at
-        ? new Date(paymentEntity.captured_at * 1000)
-        : new Date(),
-    });
+    const createdRecord = await Payment.findOneAndUpdate(
+      { paymentOrderId: normalizeText(paymentEntity?.order_id, paymentEntity.id) },
+      {
+        inviteCode,
+        weddingId,
+        guestName: normalizeText(
+          notes.guestName || paymentEntity?.email || paymentEntity?.contact,
+          'Razorpay Guest'
+        ),
+        relation: normalizeText(notes.relation, 'QR Payment'),
+        amount: toRupees(paymentEntity?.amount),
+        upiId,
+        weddingName,
+        paymentStatus: paymentEntity?.status === 'captured' ? 'completed' : 'pending',
+        paymentId: paymentEntity.id,
+        paymentOrderId: normalizeText(paymentEntity?.order_id, ''),
+        paymentTime: paymentEntity?.captured_at
+          ? new Date(paymentEntity.captured_at * 1000)
+          : new Date(),
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
 
     return res.status(200).json({
       success: true,

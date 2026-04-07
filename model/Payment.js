@@ -6,6 +6,11 @@ const paymentSchema = new mongoose.Schema({
     required: true,
     index: true
   },
+  weddingId: {
+    type: String,
+    default: '',
+    index: true
+  },
   guestName: {
     type: String,
     required: true
@@ -34,6 +39,11 @@ const paymentSchema = new mongoose.Schema({
   paymentId: {
     type: String,
     default: ''
+  },
+  paymentOrderId: {
+    type: String,
+    default: '',
+    index: true
   },
   paymentTime: {
     type: Date,
