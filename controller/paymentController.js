@@ -55,10 +55,21 @@ const getAllPayments = async (req, res) => {
     let query = {};
     
     if (weddingId) {
+      const qrMatches = await QRCode.find({
+        $or: [
+          { weddingId: { $regex: weddingId, $options: 'i' } },
+          { weddingName: { $regex: weddingId, $options: 'i' } },
+        ],
+      }).select('inviteCode');
+      const inviteCodesFromWedding = qrMatches
+        .map((item) => String(item.inviteCode || '').trim())
+        .filter(Boolean);
+
       query.$or = [
         { weddingId: { $regex: weddingId, $options: 'i' } },
         { inviteCode: { $regex: weddingId, $options: 'i' } },
-        { weddingName: { $regex: weddingId, $options: 'i' } }
+        { weddingName: { $regex: weddingId, $options: 'i' } },
+        ...(inviteCodesFromWedding.length > 0 ? [{ inviteCode: { $in: inviteCodesFromWedding } }] : []),
       ];
     }
     
